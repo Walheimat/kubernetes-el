@@ -3,6 +3,7 @@
 ;;; Code:
 
 (require 'kubernetes-ast)
+(require 'kubernetes-contexts)
 (require 'kubernetes-modes)
 (require 'kubernetes-popups)
 (require 'kubernetes-props)
@@ -22,10 +23,12 @@
 (autoload 'kubernetes-display-node "kubernetes-nodes")
 (autoload 'kubernetes-display-job "kubernetes-jobs")
 (autoload 'kubernetes-display-namespace "kubernetes-namespaces")
+(autoload 'kubernetes-display-persistentvolumeclaim "kubernetes-persistentvolumeclaims")
 (autoload 'kubernetes-display-pod "kubernetes-pods")
 (autoload 'kubernetes-display-secret "kubernetes-secrets")
 (autoload 'kubernetes-display-service "kubernetes-services")
 (autoload 'kubernetes-jobs-delete-marked "kubernetes-jobs")
+(autoload 'kubernetes-persistentvolumeclaims-delete-marked "kubernetes-persistentvolumeclaims")
 (autoload 'kubernetes-pods-delete-marked "kubernetes-pods")
 (autoload 'kubernetes-secrets-delete-marked "kubernetes-secrets")
 (autoload 'kubernetes-services-delete-marked "kubernetes-services")
@@ -55,6 +58,8 @@
      (kubernetes-state-mark-deployment name))
     (`(:statefulset-name ,name)
      (kubernetes-state-mark-statefulset name))
+    (`(:persistentvolumeclaim-name ,name)
+     (kubernetes-state-mark-persistentvolumeclaim name))
     (_
      (user-error "Nothing here can be marked")))
 
@@ -82,7 +87,9 @@
     (`(:deployment-name ,name)
      (kubernetes-state-unmark-deployment name))
     (`(:statefulset-name ,name)
-     (kubernetes-state-unmark-statefulset name)))
+     (kubernetes-state-unmark-statefulset name))
+    (`(:persistentvolumeclaim-name ,name)
+     (kubernetes-state-unmark-persistentvolumeclaim name)))
   (kubernetes-state-trigger-redraw)
   (goto-char point)
   (magit-section-forward))
@@ -139,7 +146,12 @@
     (let ((n (length (kubernetes-state--get state 'marked-services))))
       (when (and (not (zerop n))
                  (y-or-n-p (format "Delete %s service%s? " n (if (equal 1 n) "" "s"))))
-        (kubernetes-services-delete-marked state))))
+        (kubernetes-services-delete-marked state)))
+
+    (let ((n (length (kubernetes-state--get state 'marked-persistentvolumeclaims))))
+      (when (and (not (zerop n))
+                 (y-or-n-p (format "Delete %s PVC%s? " n (if (equal 1 n) "" "s"))))
+        (kubernetes-persistentvolumeclaims-delete-marked state))))
 
   (kubernetes-unmark-all))
 
@@ -232,6 +244,8 @@ the magit section at point."
      (kubernetes-display-namespace namespace-name state))
     (`(:pod-name ,pod-name)
      (kubernetes-display-pod pod-name state))
+    (`(:persistentvolumeclaim-name ,persistentvolumeclaim-name)
+     (kubernetes-display-persistentvolumeclaim persistentvolumeclaim-name state))
     (`(:selector ,selector)
      (kubernetes-show-pods-for-label selector))
     (_
@@ -419,39 +433,6 @@ STATE is the current application state."
           ((&alist 'items items) config))
     (-map (-lambda ((&alist 'metadata (&alist 'name name))) name) items)))
 
-(defun kubernetes-use-context (context)
-  "Switch Kubernetes context refresh the pods buffer.
-
-CONTEXT is the name of a context as a string."
-  (interactive (list (completing-read "Context: " (kubernetes--context-names (kubernetes-state)) nil t)))
-  (kubernetes-process-kill-polling-processes)
-
-  (let ((state (kubernetes-state)))
-    (kubernetes-state-clear)
-    (kubernetes-state-update-overview-sections (kubernetes-state-overview-sections state)))
-
-  (kubernetes-state-trigger-redraw)
-
-  (when-let (buf (get-buffer kubernetes-overview-buffer-name))
-    (with-current-buffer buf
-      (goto-char (point-min))))
-
-  (let ((state (kubernetes-state)))
-    (kubernetes-kubectl-config-use-context
-     kubernetes-props
-     state
-     context
-     (lambda (_)
-       (when kubernetes-default-overview-namespace
-         (kubernetes-set-namespace kubernetes-default-overview-namespace
-                                   state))
-       (kubernetes-state-trigger-redraw)))))
-
-(defun kubernetes--context-names (state)
-  (-let* ((config (or (kubernetes-state--get state 'config) (kubernetes-kubectl-await-on-async kubernetes-props state #'kubernetes-kubectl-config-view)))
-          ((&alist 'contexts contexts) config))
-    (--map (alist-get 'name it) contexts)))
-
 (defun kubernetes--edit-resource (kind name)
   (kubernetes-kubectl-edit-resource kubernetes-props
                                     (kubernetes-state)
@@ -483,6 +464,8 @@ THING must be a valid target for `kubectl edit'."
      (kubernetes--edit-resource "job" name))
     (`(:node-name ,name)
      (kubernetes--edit-resource "node" name))
+    (`(:persistentvolumeclaim-name ,name)
+     (kubernetes--edit-resource "persistentvolumeclaim" name))
     (`(:pod-name ,name)
      (kubernetes--edit-resource "pod" name))
     (`(:secret-name ,name)

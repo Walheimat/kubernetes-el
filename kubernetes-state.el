@@ -8,6 +8,7 @@
 (require 'subr-x)
 
 (require 'kubernetes-vars)
+(require 'kubernetes-process)
 
 
 ;;; Main state
@@ -52,6 +53,7 @@
        (setf (alist-get 'marked-deployments next nil t) nil)
        (setf (alist-get 'marked-statefulsets next nil t) nil)
        (setf (alist-get 'marked-jobs next nil t) nil)
+       (setf (alist-get 'marked-persistentvolumeclaims next nil t) nil)
        (setf (alist-get 'marked-pods next nil t) nil)
        (setf (alist-get 'marked-secrets next nil t) nil)
        (setf (alist-get 'marked-services next nil t) nil))
@@ -106,6 +108,32 @@
          (setf (alist-get 'configmaps-pending-deletion next)
                (seq-intersection (alist-get 'configmaps-pending-deletion next)
                                  configmap-names))))
+
+      ;; Persistent Volume Claims.
+
+      (:mark-persistentvolumeclaim
+       (let ((cur (alist-get 'marked-persistentvolumeclaims state)))
+         (setf (alist-get 'marked-persistentvolumeclaims next)
+               (delete-dups (cons args cur)))))
+      (:unmark-persistentvolumeclaim
+       (setf (alist-get 'marked-persistentvolumeclaims next)
+             (remove args (alist-get 'marked-persistentvolumeclaims next))))
+      (:delete-persistentvolumeclaim
+       (let ((updated (cons args (alist-get 'persistentvolumeclaims-pending-deletion state))))
+         (setf (alist-get 'persistentvolumeclaims-pending-deletion next)
+               (delete-dups updated))))
+      (:update-persistentvolumeclaims
+       (setf (alist-get 'persistentvolumeclaims next) args)
+
+       ;; Prune deleted persistentvolumeclaims from state.
+       (-let* (((&alist 'items persistentvolumeclaims) args)
+               (persistentvolumeclaim-names (seq-map #'kubernetes-state-resource-name (append persistentvolumeclaims nil))))
+         (setf (alist-get 'marked-persistentvolumeclaims next)
+               (seq-intersection (alist-get 'marked-persistentvolumeclaims next)
+                                 persistentvolumeclaim-names))
+         (setf (alist-get 'persistentvolumeclaims-pending-deletion next)
+               (seq-intersection (alist-get 'persistentvolumeclaims-pending-deletion next)
+                                 persistentvolumeclaim-names))))
 
       ;; Secrets
 
@@ -385,8 +413,48 @@
   (kubernetes-state-update :delete-statefulset statefulset-name)
   (kubernetes-state-update :unmark-statefulset statefulset-name))
 
+(defun kubernetes-state-mark-persistentvolumeclaim (persistentvolumeclaim-name)
+  (cl-assert (stringp persistentvolumeclaim-name))
+  (kubernetes-state-update :mark-persistentvolumeclaim persistentvolumeclaim-name))
+
+(defun kubernetes-state-unmark-persistentvolumeclaim (persistentvolumeclaim-name)
+  (cl-assert (stringp persistentvolumeclaim-name))
+  (kubernetes-state-update :unmark-persistentvolumeclaim persistentvolumeclaim-name))
+
+(defun kubernetes-state-delete-persistentvolumeclaim (persistentvolumeclaim-name)
+  (cl-assert (stringp persistentvolumeclaim-name))
+  (kubernetes-state-update :delete-persistentvolumeclaim persistentvolumeclaim-name)
+  (kubernetes-state-update :unmark-persistentvolumeclaim persistentvolumeclaim-name))
+
 (defun kubernetes-state-unmark-all ()
   (kubernetes-state-update :unmark-all))
+
+
+(defun kubernetes-state--refresh-now (type &optional interactive raw)
+  "Force a refresh of the state data for the given resource TYPE.
+
+INTERACTIVE denotes whether or not this function was invoked
+interactively.  RAW allows for providing explicit kubectl
+arguments."
+  (interactive "SResource: \np\ni")
+  (kubernetes-kubectl-await
+   (apply-partially #'kubernetes-kubectl
+                    kubernetes-props
+                    (kubernetes-state)
+                    (if raw (split-string raw) (list "get" (symbol-name type) "-o" "json")))
+   (lambda (buf)
+     (with-current-buffer buf
+       (when interactive
+         (message (concat "Updated " (symbol-name type) ".")))
+       (funcall (intern (format "kubernetes-state-update-%s" (symbol-name type)))
+                (json-read-from-string (buffer-string)))
+       (-let* (((&alist 'items)
+                (kubernetes-state--get (kubernetes-state) type)))
+         (seq-map (lambda (item)
+                    (-let* (((&alist 'metadata (&alist 'name)) item)) name))
+                  items))))
+   nil
+   #'ignore))
 
 
 ;; State accessors
@@ -397,8 +465,8 @@
          (canned (or canned (-partial #'kubernetes-kubectl-get s-attr))))
     `(progn
        (defun ,(intern (format "kubernetes-%s-refresh" s-attr)) (&optional interactive)
-         (unless (,(intern (format "kubernetes-process-poll-%s-process-live-p" s-attr)))
-           (,(intern (format "kubernetes-process-set-poll-%s-process" s-attr))
+         (unless (poll-process-live-p kubernetes--global-process-ledger (quote ,attr))
+           (set-process-for-resource kubernetes--global-process-ledger (quote ,attr)
             (funcall
              ,canned
              kubernetes-props
@@ -407,28 +475,11 @@
                (,(intern (format "kubernetes-state-update-%s" s-attr)) response)
                (when interactive
                  (message (concat "Updated " ,s-attr "."))))
-             (function
-              ,(intern (format "kubernetes-process-release-poll-%s-process" s-attr)))))))
+             (-partial 'release-process-for-resource kubernetes--global-process-ledger (quote ,attr))
+             ))))
        (defun ,(intern (format "kubernetes-%s-refresh-now" s-attr)) (&optional interactive)
          (interactive "p")
-         (kubernetes-kubectl-await
-          (apply-partially #'kubernetes-kubectl
-                           kubernetes-props
-                           (kubernetes-state)
-                           ',(if raw (split-string raw) (list "get" s-attr "-o" "json")))
-          (lambda (buf)
-            (with-current-buffer buf
-              (when interactive
-                (message (concat "Updated " ,s-attr ".")))
-              (,(intern (format "kubernetes-state-update-%s" s-attr))
-               (json-read-from-string (buffer-string)))
-              (-let* (((&alist 'items)
-                       (kubernetes-state--get (kubernetes-state) (quote ,attr))))
-                (seq-map (lambda (item)
-                           (-let* (((&alist 'metadata (&alist 'name)) item)) name))
-                         items))))
-          nil
-          #'ignore)))))
+         (kubernetes-state--refresh-now (quote ,attr) interactive ,raw)))))
 
 (defun kubernetes-state--get (state type)
   "Get the entry for corresponding resource TYPE from STATE."
@@ -503,6 +554,9 @@
 (kubernetes-state--define-setter label-query (label-name)
   (cl-assert (stringp label-name)))
 
+(kubernetes-state--define-setter persistentvolumeclaims (persistentvolumeclaims)
+  (cl-assert (listp persistentvolumeclaims)))
+
 (defun kubernetes-state-overview-sections (state)
   (or (alist-get 'overview-sections state)
       (let* ((configurations (append kubernetes-overview-custom-views-alist kubernetes-overview-views-alist))
@@ -521,7 +575,8 @@
                                   pods
                                   secrets
                                   services
-                                  nodes))
+                                  nodes
+                                  persistentvolumeclaims))
                      resources)))
 
 (defun kubernetes-state-kubectl-flags (state)
@@ -587,6 +642,7 @@ If lookup fails, return nil."
 (kubernetes-state-define-named-lookup secret secrets)
 (kubernetes-state-define-named-lookup service services)
 (kubernetes-state-define-named-lookup node nodes)
+(kubernetes-state-define-named-lookup persistentvolumeclaim persistentvolumeclaims)
 
 (defun kubernetes-state-resource-name (resource)
   "Get the name of RESOURCE from its metadata.
